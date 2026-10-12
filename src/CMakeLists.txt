@@ -38,6 +38,7 @@ set(SOURCE_FILES
 	"${SOURCE_DIR}/Crash/PDB/PDBHandler.h"
 	"${SOURCE_DIR}/Crash/CrashHandler.cpp"
 	"${SOURCE_DIR}/Crash/CrashHandler.h"
+	"${SOURCE_DIR}/Crash/ReportWriter.h"
 	"${SOURCE_DIR}/Fixes/ActorIsHostileToActorFix.h"
 	"${SOURCE_DIR}/Fixes/BackportedBA2Support.h"
 	"${SOURCE_DIR}/Fixes/BakaMaxPapyrusOps.h"
@@ -202,7 +203,6 @@ find_package(tomlplusplus REQUIRED CONFIG)
 find_package(xbyak REQUIRED CONFIG)
 find_package(magic_enum CONFIG REQUIRED)
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-find_package(OpenVR REQUIRED)
 find_package(zycore CONFIG REQUIRED)
 find_package(zydis CONFIG REQUIRED)
 
@@ -362,6 +362,8 @@ foreach(DEPLOY_TARGET $ENV{FalloutPluginTargets})
 	endif()
 endforeach()
 
+option(BUILD_PLUGIN_ARCHIVE "Create the release archive after building" OFF)
+if(BUILD_PLUGIN_ARCHIVE)
 set(ZIP_DIR "${CMAKE_CURRENT_BINARY_DIR}/zip")
 add_custom_target(build-time-make-directory ALL
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${ZIP_DIR}"
@@ -399,3 +401,5 @@ ADD_CUSTOM_COMMAND(
 	COMMAND ${CMAKE_COMMAND} -E tar cf ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_ZIP} --format=7zip -- .
 	WORKING_DIRECTORY ${ZIP_DIR}
 )
+
+endif()
