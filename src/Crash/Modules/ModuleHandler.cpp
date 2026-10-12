@@ -182,7 +182,7 @@ namespace Crash::Modules
 			}
 
 		private:
-			REL::Offset2ID _offset2ID{ std::execution::par_unseq };
+			REL::Offset2ID _offset2ID;
 		};
 
 		class Factory
@@ -355,8 +355,8 @@ namespace Crash::Modules
 
 		decltype(get_loaded_modules()) results;
 		results.resize(modules.size());
+		// Keep module inspection on the thread with the crash-report SEH handler.
 		std::for_each(
-			std::execution::par_unseq,
 			modules.begin(),
 			modules.end(),
 			[&](auto&& a_elem) {

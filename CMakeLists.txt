@@ -37,3 +37,15 @@ if(MSVC_VERSION GREATER_EQUAL 1936 AND MSVC_IDE) # 17.6+
 </Project>
 ]==] @ONLY)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  find_package(spdlog CONFIG REQUIRED)
+  add_executable(BuffoutCrashReportTests tests/CrashReportTests.cpp)
+  target_compile_features(BuffoutCrashReportTests PRIVATE cxx_std_23)
+  target_compile_options(BuffoutCrashReportTests PRIVATE /EHa /utf-8)
+  target_compile_definitions(BuffoutCrashReportTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_include_directories(BuffoutCrashReportTests PRIVATE src)
+  target_link_libraries(BuffoutCrashReportTests PRIVATE spdlog::spdlog)
+  add_test(NAME Buffout.CrashReport COMMAND BuffoutCrashReportTests "${CMAKE_BINARY_DIR}/test-output")
+endif()

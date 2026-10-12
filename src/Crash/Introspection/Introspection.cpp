@@ -1067,8 +1067,9 @@ namespace Crash::Introspection
 	{
 		std::vector<std::string> results;
 		results.resize(a_data.size());
+		// Invalid-pointer probes rely on the crashing thread's SEH translator.
+		// A parallel execution policy can move those probes to unprotected workers.
 		std::for_each(
-			std::execution::par_unseq,
 			a_data.begin(),
 			a_data.end(),
 			[&](auto& a_val) {

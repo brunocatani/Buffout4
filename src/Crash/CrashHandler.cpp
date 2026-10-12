@@ -1,4 +1,5 @@
 #include "Crash/CrashHandler.h"
+#include "Crash/ReportWriter.h"
 
 #include "Crash/Introspection/Introspection.h"
 #include "Crash/Modules/ModuleHandler.h"
@@ -44,42 +45,13 @@
 #define NOMCX
 
 #include <Windows.h>
-#include <openvr.h>
 #include <winternl.h>
-using namespace vr;
 
 #undef max
 #undef min
 
 namespace Crash
 {
-	class SEHException : public std::exception
-	{
-	public:
-		SEHException(const std::string& message, DWORD code) :
-			_message(message), _code(code) {}
-
-		const char* what() const noexcept override
-		{
-			return _message.c_str();
-		}
-
-		DWORD code() const noexcept
-		{
-			return _code;
-		}
-
-	private:
-		std::string _message;
-		DWORD _code;
-	};
-
-	// SEH to C++ exception translator function
-	void seh_translator(unsigned int code, EXCEPTION_POINTERS*)
-	{
-		throw SEHException("SEH Exception occurred", code);
-	}
-
 	Callstack::Callstack(const ::EXCEPTION_RECORD& a_except)
 	{
 		const auto exceptionAddress = reinterpret_cast<std::uintptr_t>(a_except.ExceptionAddress);
@@ -522,61 +494,6 @@ namespace Crash
 				gibibyte(mem.physical_total - mem.physical_available), gibibyte(mem.physical_total));
 		}
 
-		void print_vrinfo(spdlog::logger& a_log)
-		{
-			static auto openvr = GetModuleHandle("openvr_api");  // dynamically attach to open_vr
-			if (openvr) {
-				static auto _VR_GetGenericInterface = reinterpret_cast<decltype(&VR_GetGenericInterface)>(GetProcAddress(openvr, "VR_GetGenericInterface"));
-				static auto _VR_IsHmdPresent = reinterpret_cast<decltype(&VR_IsHmdPresent)>(GetProcAddress(openvr, "VR_IsHmdPresent"));
-				static auto _VR_IsRuntimeInstalled = reinterpret_cast<decltype(&VR_IsRuntimeInstalled)>(GetProcAddress(openvr, "VR_IsRuntimeInstalled"));
-				if (_VR_GetGenericInterface && _VR_IsHmdPresent && _VR_IsRuntimeInstalled && _VR_IsHmdPresent() && _VR_IsRuntimeInstalled()) {
-					a_log.critical("VR SPECS:"sv);
-					// Loading the SteamVR Runtime
-					EVRInitError eError = VRInitError_None;
-					auto HMD = (IVRSystem*)_VR_GetGenericInterface(IVRSystem_Version, &eError);
-
-					if (eError != VRInitError_None) {
-						a_log.critical("\tUnable to initialize VR"sv);
-						return;
-					}
-					const std::vector<std::pair<std::string, ETrackedDeviceProperty>> propListString{
-						{ "Model", Prop_ModelNumber_String },
-						{ "Manufacturer", Prop_ManufacturerName_String },
-						{ "Tracking System", Prop_TrackingSystemName_String },
-						{ "Hardware Revision", Prop_HardwareRevision_String },
-						{ "Driver Version", Prop_DriverVersion_String },
-						{ "Render Model", Prop_RenderModelName_String },
-						{ "Additional Data", Prop_AdditionalSystemReportData_String },
-						{ "Expected Controller Type", Prop_ExpectedControllerType_String },
-						{ "Controller Type", Prop_ControllerType_String }
-					};
-					const std::vector<std::pair<std::string, ETrackedDeviceProperty>> propListFloat{
-						//{ "Battery %", Prop_DeviceBatteryPercentage_Float },
-						//{ "Power Usage", Prop_DevicePowerUsage_Float }, // maybe be future value
-						{ "Display Frequency", Prop_DisplayFrequency_Float }
-					};
-					const std::vector<std::pair<std::string, ETrackedDeviceProperty>> propListBool{
-						{ "Wireless", Prop_DeviceIsWireless_Bool },
-						{ "Charging", Prop_DeviceIsCharging_Bool },
-						{ "Update Available", Prop_Firmware_UpdateAvailable_Bool },
-					};
-					char propValue[k_unMaxPropertyStringSize];
-					for (const auto& entry : propListString) {
-						HMD->GetStringTrackedDeviceProperty(k_unTrackedDeviceIndex_Hmd, entry.second, propValue, (std::uint32_t)std::size(propValue));
-						a_log.critical("\t{}: {}"sv, entry.first, propValue);
-					}
-					for (const auto& entry : propListFloat) {
-						const auto fpropValue = HMD->GetFloatTrackedDeviceProperty(k_unTrackedDeviceIndex_Hmd, entry.second);
-						a_log.critical("\t{}: {}"sv, entry.first, fpropValue);
-					}
-					for (const auto& entry : propListBool) {
-						const auto bpropValue = HMD->GetBoolTrackedDeviceProperty(k_unTrackedDeviceIndex_Hmd, entry.second);
-						a_log.critical("\t{}: {}"sv, entry.first, bpropValue);
-					}
-				}
-			}
-		}
-
 		std::int32_t __stdcall UnhandledExceptions(::EXCEPTION_POINTERS* a_exception) noexcept
 		{
 #ifndef NDEBUG
@@ -593,35 +510,26 @@ namespace Crash
 #endif
 			// Install the SEH-to-C++ exception translator
 			_set_se_translator(seh_translator);
+			std::shared_ptr<spdlog::logger> log;
 			try {
 				static std::mutex sync;
 				const std::lock_guard l{ sync };
 
-				const auto modules = Modules::get_loaded_modules();
-				const std::span cmodules{ modules.begin(), modules.end() };
-				const auto log = get_log();
-
-				const auto print = [&](auto&& a_functor, std::string a_name = "") {
-					log->critical(""sv);
-					try {
-						a_functor();
-					} catch (const std::exception& e) {
-						log->critical("\t{}:\t{}"sv, a_name, e.what());
-					} catch (...) {
-						log->critical("\t{}:\tERROR"sv, a_name);
-					}
-					log->flush();
-				};
-
+				log = get_log();
 				const auto runtimeVer = REL::Module::get().version();
 				log->critical("Fallout 4 v{}.{}.{}"sv, runtimeVer[0], runtimeVer[1], runtimeVer[2]);
-				log->critical("Buffout 4 v{}.{}.{} {} {}"sv, Plugin::VERSION[0], Plugin::VERSION[1], Plugin::VERSION[2], __DATE__, __TIME__);
+				log->critical("Buffout 4 v{}.{}.{} {} {} (personal OpenComposite-safe reporting)"sv, Plugin::VERSION[0], Plugin::VERSION[1], Plugin::VERSION[2], __DATE__, __TIME__);
 				log->flush();
 
+				write_raw_context(*log, *a_exception->ExceptionRecord, *a_exception->ContextRecord);
+				std::vector<module_pointer> modules;
+				write_section(*log, "module enumeration", [&] { modules = Modules::get_loaded_modules(); });
+				const std::span cmodules{ modules.begin(), modules.end() };
+				const auto print = [&](auto&& a_functor, std::string_view a_name) {
+					write_section(*log, a_name, a_functor);
+				};
+
 				print([&]() { print_exception(*log, *a_exception->ExceptionRecord, cmodules); }, "print_exception");
-				print([&]() { print_settings(*log); }, "print_settings");
-				print([&]() { print_sysinfo(*log); }, "print_sysinfo");
-				print([&]() { print_vrinfo(*log); }, "print_vrinfo");
 
 				print(
 					[&]() {
@@ -635,18 +543,25 @@ namespace Crash
 				print([&]() { print_modules(*log, cmodules); }, "print_modules");
 				print([&]() { print_xse_plugins(*log, cmodules); }, "print_xse_plugins");
 				print([&]() { print_plugins(*log); }, "print_plugins");
-			} catch (const SEHException& se) {
-				// Log the SEH exception converted to a C++ exception
-				const auto log = get_log();
-				log->critical("SEH Exception caught: {} (Code: 0x{:X})", se.what(), se.code());
+
+				// Finish and flush the original crash evidence before optional metadata.
+				// Never call into OpenVR here: OpenComposite aborts on unsupported
+				// interfaces, even though its version-validity export returns true.
+				print([&]() { print_settings(*log); }, "print_settings");
+				print([&]() { print_sysinfo(*log); }, "print_sysinfo");
 			} catch (const std::exception& e) {
-				// Log the C++ exception
-				const auto log = get_log();
-				log->critical("Caught C++ exception: {}", e.what());
+				// Reopening get_log() here used to truncate the original report.
+				logger::critical("Crash report generation failed: {}", e.what());
+				if (log) {
+					log->critical("Report generation stopped: {}. Original context above is retained.", e.what());
+					log->flush();
+				}
 			} catch (...) {
-				// Catch any other unknown exception
-				const auto log = get_log();
-				log->critical("Caught an unknown exception");
+				logger::critical("Crash report generation failed with an unknown exception");
+				if (log) {
+					log->critical("Report generation stopped with an unknown exception. Original context above is retained.");
+					log->flush();
+				}
 			}
 			REX::W32::TerminateProcess(REX::W32::GetCurrentProcess(), EXIT_FAILURE);
 			return 1;
