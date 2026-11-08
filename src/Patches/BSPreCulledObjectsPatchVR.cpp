@@ -1,7 +1,5 @@
 #include "Patches/BSPreCulledObjectsPatchVR.h"
 
-#include <array>
-#include <shared_mutex>
 
 namespace Patches::BSPreCulledObjectsPatchVR
 {
@@ -18,8 +16,8 @@ namespace Patches::BSPreCulledObjectsPatchVR
 			};
 		}
 
-		// Unsynchronised ID→3D payload. One instance per shard; the owning
-		// shard's shared_mutex provides synchronisation (see ShardedMap).
+		// Unsynchronised ID→3D payload; the engine's ID-to-3D lock provides
+		// synchronisation (see EngineIDTo3DWriteLock).
 		class IDTo3DMap
 		{
 		public:
@@ -153,45 +151,54 @@ namespace Patches::BSPreCulledObjectsPatchVR
 		};
 
 		// ----------------------------------------------------------------
-		// Sharded lock layer.
+		// Synchronisation: the engine's own ID-to-3D lock.
 		//
-		// The map is read-dominated (millions of Get3DForID lookups/sec)
-		// and written rarely but in bursts (object load/unload, heaviest
-		// at cell transitions). A single shared_mutex serialises every
-		// writer against every reader; at transition time that stalls the
-		// culling worker threads.
+		// Stock VR guards its ID-to-3D table with one BSReadWriteLock
+		// (0x146878AD8). BSPrecomputedVisibility's DoQuery (0x14277D010)
+		// takes it for reading, starts the ShadowSplitJobs that resolve
+		// IDs through Get3DForID (AddObjectByID worker 0x1427E05F0) and
+		// use the raw objects, waits for them, then unlocks. Writers
+		// (UpdateIDto3DMap, 0x1427DF7B0) change the table under the write
+		// lock, so the reference that destroys an unloaded object is
+		// always dropped while no job holds a raw pointer to it.
 		//
-		// A copy-on-write atomic-snapshot scheme would make readers fully
-		// lock-free, but every write would have to copy the whole map —
-		// and each entry is an RE::NiPointer, so a copy is a refcount
-		// storm across every live 3D object on every insert/erase. With
-		// the burst write pattern that is far worse than locking.
-		//
-		// Sharding is the safe middle ground: split the map by formID into
-		// N independently-locked shards. Writes stay O(1); a writer only
-		// blocks the readers (and writers) that hit the same 1/N shard, so
-		// transition-time contention drops by ~N. Reads still take a
-		// shared_lock, but it is almost always the uncontended SRWLock
-		// fast path.
+		// This map holds its own reference to every object, so dropping
+		// an entry is what destroys it. It must therefore change under
+		// that same write lock: dropped outside it, a job could still be
+		// culling the object (and building render passes for its shader
+		// properties) while it is freed, which corrupted shader property
+		// and render pass memory at cell transitions. Readers already run
+		// under the engine's read lock, so no lock of our own is needed.
+		// BSReadWriteLock is recursive for its writer (LockForWrite
+		// counts re-entry by the owning thread), so the stock function
+		// can take it again inside our hold.
 		// ----------------------------------------------------------------
-		constexpr std::size_t kShardCount = 64;  // power of two
-		static_assert(
-			(kShardCount & (kShardCount - 1)) == 0,
-			"kShardCount must be a power of two");
-
-		[[nodiscard]] inline std::size_t ShardIndex(std::uint32_t a_formID) noexcept
+		class EngineIDTo3DWriteLock
 		{
-			// Shard on the low bits of the file-index-stripped formID. A
-			// given formID always maps to the same shard, so find/insert/
-			// erase agree. Low bits of a formID vary the most, so adjacent
-			// IDs spread evenly across shards.
-			return (a_formID & 0x00FFFFFF) & (kShardCount - 1);
-		}
+		public:
+			EngineIDTo3DWriteLock() noexcept { LockForWrite()(Lock()); }
+			~EngineIDTo3DWriteLock() noexcept { UnlockForWrite()(Lock()); }
 
-		struct Shard
-		{
-			mutable std::shared_mutex lock;
-			IDTo3DMap map;
+			EngineIDTo3DWriteLock(const EngineIDTo3DWriteLock&) = delete;
+			EngineIDTo3DWriteLock& operator=(const EngineIDTo3DWriteLock&) = delete;
+
+		private:
+			using LockFn = void(void*);
+
+			[[nodiscard]] static void* Lock() noexcept
+			{
+				return reinterpret_cast<void*>(REL::Offset(0x6878AD8).address());
+			}
+			// BSReadWriteLock::LockForWrite and ::UnlockForWrite, the pair
+			// the stock UpdateIDto3DMap calls on the lock above.
+			[[nodiscard]] static LockFn* LockForWrite() noexcept
+			{
+				return reinterpret_cast<LockFn*>(REL::Offset(0x1B93330).address());
+			}
+			[[nodiscard]] static LockFn* UnlockForWrite() noexcept
+			{
+				return reinterpret_cast<LockFn*>(REL::Offset(0x1B93580).address());
+			}
 		};
 
 		class IDTo3DHandler
@@ -241,27 +248,23 @@ namespace Patches::BSPreCulledObjectsPatchVR
 				return singleton;
 			}
 
-			// ---- Sharded map access ---- //
+			// ---- Map access ---- //
+			// Reads need the engine's ID-to-3D read lock and writes its
+			// write lock (see EngineIDTo3DWriteLock).
 
 			[[nodiscard]] RE::NiAVObject* MapFindOne(std::uint32_t a_id) const noexcept
 			{
-				const auto& shard = _shards[ShardIndex(a_id)];
-				std::shared_lock<std::shared_mutex> lk(shard.lock);
-				return shard.map.find_one(a_id);
+				return _map.find_one(a_id);
 			}
 
 			void MapInsertOrAssign(std::uint32_t a_id, RE::NiAVObject* a_obj)
 			{
-				auto& shard = _shards[ShardIndex(a_id)];
-				std::unique_lock<std::shared_mutex> lk(shard.lock);
-				shard.map.insert_or_assign(a_id, a_obj);
+				_map.insert_or_assign(a_id, a_obj);
 			}
 
 			void MapErase(std::uint32_t a_id)
 			{
-				auto& shard = _shards[ShardIndex(a_id)];
-				std::unique_lock<std::shared_mutex> lk(shard.lock);
-				shard.map.erase(a_id);
+				_map.erase(a_id);
 			}
 
 			// ---- Stock engine bridges ---- //
@@ -312,7 +315,7 @@ namespace Patches::BSPreCulledObjectsPatchVR
 				reinterpret_cast<const std::uint8_t*>(REL::Offset(0x391D830).address())
 			};
 
-			std::array<Shard, kShardCount> _shards;
+			IDTo3DMap _map;
 		};
 
 		// ----------------------------------------------------------------
@@ -459,13 +462,18 @@ namespace Patches::BSPreCulledObjectsPatchVR
 
 		void UpdateIDto3DMap(std::uint32_t a_id, RE::NiAVObject* a_obj)
 		{
+			// Both tables change under the engine's write lock, so the
+			// reference this map drops (which may destroy the object) is
+			// released while no culling job holds the object.
+			EngineIDTo3DWriteLock lock;
+
 			// 1. Call the original to keep the stock hash table
 			//    populated for the un-hooked main AddToCullingGroup path.
 			if (OriginalUpdateIDto3DMap) {
 				OriginalUpdateIDto3DMap(a_id, a_obj);
 			}
 
-			// 2. Also write to our fast sharded map, used by the hooked
+			// 2. Also write to our fast map, used by the hooked
 			//    rain/shadow arenas and the Get3DForID call-site hook.
 			auto& handler = IDTo3DHandler::GetSingleton();
 			if (!handler.UsePreCulledObjects()) {
@@ -487,7 +495,7 @@ namespace Patches::BSPreCulledObjectsPatchVR
 		// (function at 0x27E05F0). VR's stock code resolves every formID
 		// through the slow stock hash table at 0x14391D880 — a branch
 		// flag at 0x391D848 is permanently 1 and never cleared, so the
-		// fast path is effectively dead. We resolve from our sharded map
+		// fast path is effectively dead. We resolve from our map
 		// (O(1) amortised), return nullptr on miss, and keep a 1-in-4096
 		// sentinel verifier that calls the original to catch any future
 		// map-vs-stock divergence.
@@ -596,8 +604,8 @@ namespace Patches::BSPreCulledObjectsPatchVR
 				return OriginalGet3DForID(a_formID);
 			}
 
-			// Sharded shared_lock is taken/released inside MapFindOne, so
-			// no reader lock is held during the bookkeeping below.
+			// The only caller (AddObjectByID worker, from DoQuery's
+			// ShadowSplitJobs) runs under the engine's ID-to-3D read lock.
 			RE::NiAVObject* obj = handler.MapFindOne(a_formID);
 
 			auto& counters = PerfCounters::get();
